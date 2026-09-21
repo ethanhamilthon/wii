@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+/* ---------- Wii dark theme + JetBrains Mono everywhere ---------- */
+@theme {
+  --font-sans: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* raw palette, ported 1:1 from the old vanilla styles.css */
+  --color-bg: #0a0a0a;
+  --color-panel: #111111;
+  --color-raised: #1f1f1f;
+  --color-border: #262626;
+  --color-border-strong: #333333;
+  --color-text: #ededed;
+  --color-text-main: #ededed;
+  --color-dim: #a1a1a1;
+  --color-faint: #737373;
+  --color-green: #33c07a;
+  --color-red: #ff5c5c;
+  --color-amber: #f5a623;
+  --color-blue: #3291ff;
+  --color-purple: #8a63ff;
+  --color-cyan: #3ecfcf;
+
+  /* shadcn/ui semantic tokens mapped onto the same dark palette so
+     hand-rolled shadcn-style primitives (Button, Dialog, Input...) work
+     with the familiar bg-background/text-foreground/border-input classes
+     without needing a second, disconnected theme. */
+  --color-background: var(--color-bg);
+  --color-foreground: var(--color-text-main);
+  --color-card: var(--color-panel);
+  --color-card-foreground: var(--color-text-main);
+  --color-popover: var(--color-panel);
+  --color-popover-foreground: var(--color-text-main);
+  --color-primary: var(--color-text-main);
+  --color-primary-foreground: var(--color-bg);
+  --color-secondary: var(--color-panel);
+  --color-secondary-foreground: var(--color-text-main);
+  --color-muted: var(--color-raised);
+  --color-muted-foreground: var(--color-dim);
+  --color-accent: var(--color-raised);
+  --color-accent-foreground: var(--color-text-main);
+  --color-destructive: var(--color-red);
+  --color-destructive-foreground: var(--color-text-main);
+  --color-input: var(--color-border-strong);
+  --color-ring: var(--color-border-strong);
+
+  --radius-lg: 12px;
+  --radius-md: 9px;
+  --radius-sm: 6px;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-bg);
+  color: var(--color-text-main);
+  font-synthesis: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* textareas/inputs should remain selectable/editable */
+input,
+textarea {
+  user-select: text;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}

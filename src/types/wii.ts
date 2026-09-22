@@ -2,10 +2,8 @@ export interface ProviderSettings {
   id: string;
   name: string;
   baseUrl: string;
-  model: string;
   apiKey: string;
-  reasoningEffort?: string | null;
-  models?: string[];
+  models: string[];
 }
 
 export interface MultiProviderConfig {
@@ -35,6 +33,8 @@ export interface MessageItem {
   id: string;
   role: "user" | "assistant" | "error";
   text: string;
+  thinking?: string;
+  thinkingStreaming?: boolean;
   tools?: ToolState[];
 }
 
@@ -46,6 +46,8 @@ export interface SessionState {
   status: "running" | "idle" | "error";
   alive: boolean;
   busy: boolean;
+  model: string;
+  reasoningEffort: string;
   messages: MessageItem[];
   tools: Record<string, ToolState>;
   inputTokens: number;
@@ -53,12 +55,35 @@ export interface SessionState {
   cacheReadTokens: number;
   contextTokens: number;
   cost: number;
+  /** Pending `ctx.ui.*` dialog request from a plugin tool, if any (generic \u2014
+   *  Wii doesn't know which plugin/tool asked). See docs/rpc.md "Extension UI Protocol". */
+  pendingUIRequest: ExtensionUIRequest | null;
+  /** Text widgets published by plugins through `ctx.ui.setWidget()`. */
+  pluginWidgets: Record<string, PluginWidget>;
+}
+
+export interface PluginWidget {
+  key: string;
+  lines: string[];
+  placement: "aboveEditor" | "belowEditor";
+}
+
+export interface ExtensionUIRequest {
+  id: string;
+  method: "select" | "confirm" | "input" | "editor";
+  title?: string;
+  message?: string;
+  options?: string[];
+  placeholder?: string;
+  prefill?: string;
 }
 
 export interface PersistedTab {
   title: string;
   projectPath: string | null;
   resumePath: string | null;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 export interface PersistedOpenTabs {

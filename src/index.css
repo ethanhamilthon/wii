@@ -81,6 +81,12 @@ textarea {
   user-select: text;
 }
 
+/* code block syntax highlight overrides */
+pre code.hljs {
+  background: transparent !important;
+  padding: 0 !important;
+}
+
 @keyframes pulse {
   0%,
   100% {

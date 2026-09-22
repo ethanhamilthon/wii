@@ -1,5 +1,6 @@
 import React from "react";
 import { useSessionStore } from "@/store/session-store";
+import { GearIcon, StackIcon } from "@radix-ui/react-icons";
 import { cn } from "@/lib/utils";
 
 export const Header: React.FC = () => {
@@ -23,6 +24,11 @@ export const Header: React.FC = () => {
           return (
             <div
               key={id}
+              ref={(el) => {
+                if (isActive && el) {
+                  el.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+                }
+              }}
               onClick={() => switchActive(id)}
               className={cn(
                 "group relative flex h-8 max-w-[220px] shrink-0 cursor-pointer items-center gap-2 rounded-xl border px-3 text-xs transition-colors",
@@ -47,7 +53,7 @@ export const Header: React.FC = () => {
               {/* Close tab on hover */}
               <button
                 type="button"
-                title="Close tab (keeps running in background)"
+                title="Close tab (keeps session history)"
                 onClick={(e) => {
                   e.stopPropagation();
                   closeTab(id);
@@ -75,7 +81,7 @@ export const Header: React.FC = () => {
           onClick={() => setSessionManagerOpen(true)}
           className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] border border-border bg-panel p-1.5 text-faint hover:bg-raised hover:text-foreground"
         >
-          <img src="/assets/icons/session-manager.svg" alt="" className="h-5 w-5" />
+          <StackIcon className="h-5 w-5" />
         </button>
 
         <button
@@ -85,7 +91,7 @@ export const Header: React.FC = () => {
           onClick={() => setCommandCenterOpen(true)}
           className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] border border-border bg-panel p-1.5 text-faint hover:bg-raised hover:text-foreground"
         >
-          <img src="/assets/icons/command-center.svg" alt="" className="h-5 w-5" />
+          <GearIcon className="h-5 w-5" />
         </button>
       </div>
     </header>

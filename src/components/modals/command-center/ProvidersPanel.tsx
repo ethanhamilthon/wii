@@ -15,9 +15,9 @@ export const ProvidersPanel: React.FC<{ onSaved: () => void }> = ({ onSaved }) =
 
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
-  const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [reasoningEffort, setReasoningEffort] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [newModelInput, setNewModelInput] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [fetchStatus, setFetchStatus] = useState("");
   const [error, setError] = useState("");
@@ -26,9 +26,8 @@ export const ProvidersPanel: React.FC<{ onSaved: () => void }> = ({ onSaved }) =
     if (activeProvider) {
       setName(activeProvider.name || "Default");
       setBaseUrl(activeProvider.baseUrl || "");
-      setModel(activeProvider.model || "");
       setApiKey(activeProvider.apiKey || "");
-      setReasoningEffort(activeProvider.reasoningEffort || "");
+      setModels(activeProvider.models || []);
     }
   }, [activeProvider?.id]);
 
@@ -39,17 +38,16 @@ export const ProvidersPanel: React.FC<{ onSaved: () => void }> = ({ onSaved }) =
       setError("Base URL must start with http:// or https://");
       return;
     }
-    if (!model.trim() || !apiKey.trim()) {
-      setError("Model and API key are required");
+    if (!apiKey.trim()) {
+      setError("API key is required");
       return;
     }
     try {
       await saveCurrentProviderForm({
         name: name.trim() || "Default",
         baseUrl: baseUrl.trim().replace(/\/$/, ""),
-        model: model.trim(),
         apiKey: apiKey.trim(),
-        reasoningEffort: reasoningEffort || null,
+        models,
       });
       onSaved();
     } catch (err) {
@@ -70,17 +68,29 @@ export const ProvidersPanel: React.FC<{ onSaved: () => void }> = ({ onSaved }) =
         .map((m: any) => m.id ?? m.name)
         .filter(Boolean);
 
-      setCachedModels(ids);
-      await saveCurrentProviderForm({ models: ids });
-      setFetchStatus(`Loaded and saved ${ids.length} model(s).`);
+      const merged = [...new Set([...models, ...ids])];
+      setModels(merged);
+      setCachedModels(merged);
+      await saveCurrentProviderForm({ models: merged });
+      setFetchStatus(`Loaded ${ids.length} model(s).`);
     } catch (err) {
       setFetchStatus(`Could not fetch models: ${err}`);
     }
   };
 
-  const availableModels = [
-    ...new Set([model, ...(activeProvider?.models || []), ...cachedModels].filter(Boolean)),
-  ];
+  const handleAddModel = () => {
+    const trimmed = newModelInput.trim();
+    if (!trimmed || models.includes(trimmed)) return;
+    const next = [...models, trimmed];
+    setModels(next);
+    setCachedModels(next);
+    setNewModelInput("");
+  };
+
+  const handleRemoveModel = (m: string) => {
+    const next = models.filter((x) => x !== m);
+    setModels(next);
+  };
 
   return (
     <form onSubmit={handleSubmit} className="grid gap-3 select-none text-xs">
@@ -146,51 +156,67 @@ export const ProvidersPanel: React.FC<{ onSaved: () => void }> = ({ onSaved }) =
         />
       </label>
 
-      <div className="flex items-end gap-2">
-        <label className="grid flex-1 gap-1 text-dim">
-          Model
+      <div className="grid gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-dim">Available models ({models.length})</span>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleFetchModels}
+            className="h-7 text-xs"
+          >
+            Fetch models
+          </Button>
+        </div>
+
+        {fetchStatus && <p className="text-[11px] text-faint">{fetchStatus}</p>}
+
+        <div className="flex gap-2">
           <Input
-            list="cc-model-options"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            required
+            value={newModelInput}
+            onChange={(e) => setNewModelInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleAddModel();
+              }
+            }}
+            placeholder="Add model ID…"
+            className="h-8 text-xs"
           />
-          <datalist id="cc-model-options">
-            {availableModels.map((m) => (
-              <option key={m} value={m} />
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleAddModel}
+            className="h-8 text-xs shrink-0"
+          >
+            Add
+          </Button>
+        </div>
+
+        {models.length > 0 && (
+          <div className="max-h-36 overflow-y-auto rounded-md border border-border bg-panel p-2 grid gap-1">
+            {models.map((m) => (
+              <div
+                key={m}
+                className="flex items-center justify-between text-xs py-0.5 px-1 rounded hover:bg-raised"
+              >
+                <span className="truncate font-mono text-[11px] text-foreground">{m}</span>
+                <button
+                  type="button"
+                  onClick={() => handleRemoveModel(m)}
+                  className="text-faint hover:text-foreground text-xs ml-2"
+                  title="Remove model"
+                >
+                  ×
+                </button>
+              </div>
             ))}
-          </datalist>
-        </label>
-
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          onClick={handleFetchModels}
-          className="h-9 shrink-0 text-xs"
-        >
-          Fetch models
-        </Button>
+          </div>
+        )}
       </div>
-
-      {fetchStatus && <p className="text-[11px] text-faint">{fetchStatus}</p>}
-
-      <label className="grid gap-1 text-dim">
-        Reasoning effort
-        <select
-          value={reasoningEffort}
-          onChange={(e) => setReasoningEffort(e.target.value)}
-          className="h-9 w-full rounded-md border border-input bg-panel px-3 text-xs text-foreground outline-none"
-        >
-          <option value="">Default</option>
-          <option value="minimal">Minimal</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">XHigh</option>
-          <option value="max">Max</option>
-        </select>
-      </label>
 
       <label className="grid gap-1 text-dim">
         API key

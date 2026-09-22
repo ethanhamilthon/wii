@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::Mutex,
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -21,10 +21,7 @@ struct ProviderSettings {
     #[serde(default = "default_provider_name")]
     name: String,
     base_url: String,
-    model: String,
     api_key: String,
-    #[serde(default)]
-    reasoning_effort: Option<String>,
     #[serde(default)]
     models: Vec<String>,
 }
@@ -51,10 +48,7 @@ struct ProviderInput {
     #[serde(default)]
     name: Option<String>,
     base_url: String,
-    model: String,
     api_key: String,
-    #[serde(default)]
-    reasoning_effort: Option<String>,
     #[serde(default)]
     models: Option<Vec<String>>,
 }
@@ -70,12 +64,122 @@ struct SessionSummary {
     search_text: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginFile {
+    id: String,
+    code: String,
+}
+
+// Wii-native plugins: `index.js` is a plain CommonJS file evaluated in the
+// frontend webview (`module.exports = { id, name, description, settings,
+// prompt(settings), hasTools }`). An optional sibling `tools.js` is a REAL pi
+// extension (registerTool/ctx.ui), loaded into pi via explicit --extension
+// only when the plugin is enabled \u2014 see pi_args(). Source lives under
+// default-plugins/<id>/ so it's readable/editable as real .js, not a Rust
+// string; seeded onto disk once, only if ~/.wii/plugins/ is empty.
+struct DefaultPlugin {
+    id: &'static str,
+    index_js: &'static str,
+    tools_js: Option<&'static str>,
+}
+
+const DEFAULT_PLUGINS: &[DefaultPlugin] = &[
+    DefaultPlugin {
+        id: "caveman",
+        index_js: include_str!("../default-plugins/caveman/index.js"),
+        tools_js: None,
+    },
+    DefaultPlugin {
+        id: "ask_user",
+        index_js: include_str!("../default-plugins/ask_user/index.js"),
+        tools_js: Some(include_str!("../default-plugins/ask_user/tools.js")),
+    },
+    DefaultPlugin {
+        id: "todo",
+        index_js: include_str!("../default-plugins/todo/index.js"),
+        tools_js: Some(include_str!("../default-plugins/todo/tools.js")),
+    },
+    DefaultPlugin {
+        id: "websearch",
+        index_js: include_str!("../default-plugins/websearch/index.js"),
+        tools_js: Some(include_str!("../default-plugins/websearch/tools.js")),
+    },
+    DefaultPlugin {
+        id: "webfetch",
+        index_js: include_str!("../default-plugins/webfetch/index.js"),
+        tools_js: Some(include_str!("../default-plugins/webfetch/tools.js")),
+    },
+    DefaultPlugin {
+        id: "quota",
+        index_js: include_str!("../default-plugins/quota/index.js"),
+        tools_js: None,
+    },
+];
+
+// --- Declarative-UI plugin HTTP proxy -------------------------------------
+// Webviews block cross-origin fetch from plugin JS (CORS); plugins call
+// `ctx.fetch(...)` in the frontend, which routes here so the *actual*
+// request leaves from the Rust process instead of the webview.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginHttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: String,
+}
+
+#[tauri::command]
+async fn plugin_http_request(
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+) -> Result<PluginHttpResponse, String> {
+    let client = reqwest::Client::new();
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let mut req = client.request(method, &url);
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    if let Some(body) = body {
+        req = req.body(body);
+    }
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let resp_headers: HashMap<String, String> = res
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+        .collect();
+    let body = res.text().await.map_err(|e| e.to_string())?;
+    Ok(PluginHttpResponse {
+        status,
+        headers: resp_headers,
+        body,
+    })
+}
+
 // One child process per open session/tab. Keyed by an internally generated id
 // (not pi's own session id) so the frontend can route events regardless of
 // whether the underlying pi session is brand new or resumed from disk.
+struct RunningSession {
+    child: CommandChild,
+    owner: String,
+    label: String,
+    resume_path: Option<PathBuf>,
+    used: bool,
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    running: HashMap<String, RunningSession>,
+    owners: HashMap<String, String>,
+}
+
 #[derive(Default)]
 struct PiState {
-    sessions: Mutex<HashMap<String, CommandChild>>,
+    sessions: Mutex<SessionRegistry>,
     settings: Mutex<Option<ProviderSettings>>,
     system_prompt: Mutex<Option<String>>,
 }
@@ -116,6 +220,12 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         }
     }
 
+    let src_pkg = source.join("package.json");
+    let dst_pkg = runtime.join("package.json");
+    if src_pkg.exists() {
+        let _ = fs::copy(src_pkg, dst_pkg);
+    }
+
     let src_pi = source.join("pi");
     let needs_copy = match (fs::metadata(&src_pi), fs::metadata(&pi_bin)) {
         (Ok(src_meta), Ok(dst_meta)) => src_meta.len() != dst_meta.len(),
@@ -147,32 +257,16 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
 fn write_pi_config(app: &AppHandle, settings: &ProviderSettings) -> Result<(), String> {
     let config = app_dir(app)?.join("pi");
     fs::create_dir_all(&config).map_err(|error| error.to_string())?;
-    let reasoning = settings
-        .reasoning_effort
-        .as_deref()
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
 
     let mut model_entries: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-
-    seen.insert(settings.model.clone());
-    model_entries.push(json!({
-        "id": settings.model,
-        "name": settings.model,
-        "reasoning": reasoning,
-        "input": ["text", "image"],
-        "contextWindow": 128000,
-        "maxTokens": 16384,
-        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-    }));
 
     for m in &settings.models {
         if seen.insert(m.clone()) {
             model_entries.push(json!({
                 "id": m,
                 "name": m,
-                "reasoning": reasoning,
+                "reasoning": true,
                 "input": ["text", "image"],
                 "contextWindow": 128000,
                 "maxTokens": 16384,
@@ -190,17 +284,19 @@ fn write_pi_config(app: &AppHandle, settings: &ProviderSettings) -> Result<(), S
                 "authHeader": true,
                 "compat": {
                     "supportsDeveloperRole": false,
-                    "supportsReasoningEffort": reasoning
+                    "supportsReasoningEffort": true
                 },
                 "models": model_entries
             }
         }
     });
-    fs::write(
-        config.join("models.json"),
-        serde_json::to_vec_pretty(&models).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+
+    let target_path = config.join("models.json");
+    let tmp_path = config.join("models.json.tmp");
+    let content = serde_json::to_vec_pretty(&models).map_err(|error| error.to_string())?;
+    fs::write(&tmp_path, &content).map_err(|error| error.to_string())?;
+    fs::rename(&tmp_path, &target_path).map_err(|error| error.to_string())?;
+
     fs::write(
         config.join("settings.json"),
         br#"{"enableInstallTelemetry":false,"defaultProjectTrust":"never"}"#,
@@ -232,6 +328,91 @@ fn system_prompt_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_dir(app)?.join("system-prompt.txt"))
 }
 
+fn user_wii_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".wii")
+}
+
+fn ensure_user_wii_dirs() -> Result<PathBuf, String> {
+    let wii = user_wii_dir();
+    // Only "plugins" (Wii-native) matters now; skills/prompts/extensions/themes
+    // are pi's own resource kinds and Wii deliberately never feeds them to pi.
+    for sub in ["plugins"] {
+        let _ = fs::create_dir_all(wii.join(sub));
+    }
+
+    // Seed the built-in plugins exactly once, ever \u2014 gated by a marker file so
+    // a user who deletes a default plugin doesn't get it silently reinstated
+    // on the next launch.
+    let plugins_dir = wii.join("plugins");
+    let seeded_marker = plugins_dir.join(".defaults-seeded");
+    if !seeded_marker.exists() {
+        for plugin in DEFAULT_PLUGINS {
+            let dir = plugins_dir.join(plugin.id);
+            if dir.exists() {
+                continue;
+            }
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(dir.join("index.js"), plugin.index_js);
+            if let Some(tools_js) = plugin.tools_js {
+                let _ = fs::write(dir.join("tools.js"), tools_js);
+            }
+        }
+        let _ = fs::write(&seeded_marker, b"1");
+    }
+
+    Ok(wii)
+}
+
+// ponytail: single JS file per plugin folder, no manifest.json — the exported
+// object carries its own id/name/description, one file to read instead of two.
+#[tauri::command]
+fn list_plugins() -> Vec<PluginFile> {
+    let dir = user_wii_dir().join("plugins");
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (id, js_path) = if path.is_dir() {
+            let candidate = path.join("index.js");
+            if !candidate.exists() {
+                continue;
+            }
+            let id = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            (id, candidate)
+        } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            let id = path.file_stem().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            (id, path.clone())
+        } else {
+            continue;
+        };
+        if let Ok(code) = fs::read_to_string(&js_path) {
+            out.push(PluginFile { id, code });
+        }
+    }
+    out
+}
+
+#[tauri::command]
+fn delete_plugin(id: String) -> Result<(), String> {
+    if id.is_empty() || id.contains('/') || id.contains("..") {
+        return Err("Invalid plugin id".into());
+    }
+    let dir = user_wii_dir().join("plugins");
+    let as_dir = dir.join(&id);
+    let as_file = dir.join(format!("{id}.js"));
+    if as_dir.is_dir() {
+        fs::remove_dir_all(as_dir).map_err(|e| e.to_string())?;
+    } else if as_file.is_file() {
+        fs::remove_file(as_file).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn emit_line(app: &AppHandle, session_id: &str, line: &[u8]) {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     match serde_json::from_slice::<Value>(line) {
@@ -251,28 +432,47 @@ fn emit_line(app: &AppHandle, session_id: &str, line: &[u8]) {
 }
 
 fn pi_args(
-    settings: &ProviderSettings,
+    model: &str,
+    reasoning_effort: Option<&str>,
     session_id: &str,
     resume_path: Option<&str>,
     system_prompt: Option<&str>,
+    sessions_dir: &Path,
+    tool_plugins: &[String],
 ) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "--mode",
-        "rpc",
-        "--provider",
-        "wii-openai",
-        "--model",
-        settings.model.as_str(),
-        "--no-context-files",
-        "--no-extensions",
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-themes",
-        "--no-approve",
-    ]
-    .iter()
-    .map(|value| value.to_string())
-    .collect();
+    let mut args: Vec<String> = vec![
+        "--mode".into(),
+        "rpc".into(),
+        "--provider".into(),
+        "wii-openai".into(),
+        "--model".into(),
+        model.to_string(),
+        "--approve".into(),
+        "--session-dir".into(),
+        sessions_dir.to_string_lossy().to_string(),
+    ];
+
+    // Wii never feeds pi its own skills/prompt-templates/themes, and never lets
+    // pi *discover* extensions on its own. Wii-native prompt customization
+    // (Plugins) reaches it only as plain text via --system-prompt below.
+    // The only extensions pi ever loads are `tools.js` files that Wii names
+    // explicitly below, one per enabled plugin that declares it needs tools
+    // (see ~/.wii/plugins/<id>/tools.js) \
+    args.push("--no-skills".into());
+    args.push("--no-prompt-templates".into());
+    args.push("--no-extensions".into());
+    args.push("--no-themes".into());
+
+    for plugin_id in tool_plugins {
+        if plugin_id.is_empty() || plugin_id.contains('/') || plugin_id.contains("..") {
+            continue;
+        }
+        let tools_path = user_wii_dir().join("plugins").join(plugin_id).join("tools.js");
+        if tools_path.exists() {
+            args.push("--extension".into());
+            args.push(tools_path.to_string_lossy().to_string());
+        }
+    }
 
     match resume_path {
         Some(path) => {
@@ -285,7 +485,7 @@ fn pi_args(
         }
     }
 
-    if let Some(effort) = settings.reasoning_effort.as_deref() {
+    if let Some(effort) = reasoning_effort {
         if !effort.is_empty() {
             args.push("--thinking".into());
             args.push(effort.to_string());
@@ -330,8 +530,13 @@ fn validate_project_path(path: &Path) -> Result<PathBuf, String> {
 fn spawn_session(
     app: &AppHandle,
     state: &PiState,
+    label: &str,
+    owner: &str,
     resume_path: Option<String>,
     project_path: Option<String>,
+    tool_plugins: Vec<String>,
+    model: String,
+    reasoning_effort: Option<String>,
 ) -> Result<String, String> {
     let settings = state
         .settings
@@ -359,13 +564,17 @@ fn spawn_session(
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
     let binary = prepare_runtime(app)?;
+    let _ = ensure_user_wii_dirs()?; // makes sure ~/.wii/plugins exists to scan
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
     let session_id = gen_session_id();
     let args = pi_args(
-        &settings,
+        &model,
+        reasoning_effort.as_deref(),
         &session_id,
         resume_path.as_deref(),
         system_prompt.as_deref(),
+        &sessions,
+        &tool_plugins,
     );
     let mut command = app
         .shell()
@@ -375,6 +584,8 @@ fn spawn_session(
         .env("PATH", path)
         .env("PI_CODING_AGENT_DIR", &config)
         .env("PI_CODING_AGENT_SESSION_DIR", &sessions)
+        .env("WII_CODING_AGENT_DIR", &config)
+        .env("WII_CODING_AGENT_SESSION_DIR", &sessions)
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_TELEMETRY", "0")
         .env("WII_API_KEY", settings.api_key.as_str())
@@ -385,12 +596,28 @@ fn spawn_session(
     {
         command = command.env("SHELL", "/bin/sh");
     }
+    let resume = resume_path.as_deref().map(|path| fs::canonicalize(path).map_err(|e| e.to_string())).transpose()?;
+    let mut registry = state.sessions.lock().map_err(|_| "Session lock poisoned".to_string())?;
+    if registry.owners.get(label).map(String::as_str) != Some(owner) {
+        return Err("WebView owner expired".into());
+    }
+    if let Some(path) = &resume {
+        if registry.running.iter().any(|(id, session)| {
+            session.resume_path.as_ref() == Some(path)
+                || (session.resume_path.is_none() && session_file(&sessions, id).as_ref() == Some(path))
+        }) {
+            return Err("Session file already open".into());
+        }
+    }
     let (mut rx, child) = command.spawn().map_err(|error| error.to_string())?;
-    state
-        .sessions
-        .lock()
-        .map_err(|_| "Session lock poisoned".to_string())?
-        .insert(session_id.clone(), child);
+    registry.running.insert(session_id.clone(), RunningSession {
+        child,
+        owner: owner.to_string(),
+        label: label.to_string(),
+        resume_path: resume,
+        used: false,
+    });
+    drop(registry);
 
     let app = app.clone();
     let sid = session_id.clone();
@@ -429,7 +656,7 @@ fn spawn_session(
         }
         if let Some(state) = app.try_state::<PiState>() {
             if let Ok(mut sessions) = state.sessions.lock() {
-                sessions.remove(&sid);
+                sessions.running.remove(&sid);
             }
         }
     });
@@ -437,16 +664,14 @@ fn spawn_session(
 }
 
 fn send(state: &PiState, session_id: &str, value: Value) -> Result<(), String> {
+    let is_prompt = value.get("type").and_then(Value::as_str) == Some("prompt");
     let mut line = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     line.push(b'\n');
-    state
-        .sessions
-        .lock()
-        .map_err(|_| "Session lock poisoned".to_string())?
-        .get_mut(session_id)
-        .ok_or("Session is not running")?
-        .write(&line)
-        .map_err(|error| error.to_string())
+    let mut registry = state.sessions.lock().map_err(|_| "Session lock poisoned".to_string())?;
+    let session = registry.running.get_mut(session_id).ok_or("Session is not running")?;
+    session.child.write(&line).map_err(|error| error.to_string())?;
+    if is_prompt { session.used = true; }
+    Ok(())
 }
 
 fn extract_text(content: &Value) -> String {
@@ -517,8 +742,8 @@ fn save_provider(
     if !(input.base_url.starts_with("http://") || input.base_url.starts_with("https://")) {
         return Err("Base URL must start with http:// or https://".into());
     }
-    if input.model.trim().is_empty() || input.api_key.trim().is_empty() {
-        return Err("Model and API key are required".into());
+    if input.api_key.trim().is_empty() {
+        return Err("API key is required".into());
     }
 
     let mut config = read_provider_config(&app)?.unwrap_or_else(|| MultiProviderConfig {
@@ -531,9 +756,7 @@ fn save_provider(
 
     if let Some(existing) = config.providers.iter_mut().find(|p| p.id == target_id) {
         existing.base_url = input.base_url.trim_end_matches('/').to_string();
-        existing.model = input.model.trim().to_string();
         existing.api_key = input.api_key.trim().to_string();
-        existing.reasoning_effort = input.reasoning_effort.filter(|v| !v.is_empty());
         if let Some(m) = input.models {
             existing.models = m;
         }
@@ -542,9 +765,7 @@ fn save_provider(
             id: target_id.clone(),
             name: target_name,
             base_url: input.base_url.trim_end_matches('/').to_string(),
-            model: input.model.trim().to_string(),
             api_key: input.api_key.trim().to_string(),
-            reasoning_effort: input.reasoning_effort.filter(|v| !v.is_empty()),
             models: input.models.unwrap_or_default(),
         });
     }
@@ -579,11 +800,71 @@ fn save_system_prompt(app: AppHandle, state: State<PiState>, text: String) -> Re
 #[tauri::command]
 fn create_session(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<PiState>,
+    owner: String,
     resume_path: Option<String>,
     project_path: Option<String>,
+    tool_plugins: Option<Vec<String>>,
+    model: String,
+    reasoning_effort: Option<String>,
 ) -> Result<String, String> {
-    spawn_session(&app, &state, resume_path, project_path)
+    spawn_session(
+        &app,
+        &state,
+        window.label(),
+        &owner,
+        resume_path,
+        project_path,
+        tool_plugins.unwrap_or_default(),
+        model,
+        reasoning_effort,
+    )
+}
+
+#[tauri::command]
+fn set_session_model(state: State<PiState>, session_id: String, model: String) -> Result<(), String> {
+    send(
+        &state,
+        &session_id,
+        json!({
+            "type": "set_model",
+            "provider": "wii-openai",
+            "modelId": model
+        }),
+    )
+}
+
+#[tauri::command]
+fn set_session_thinking(state: State<PiState>, session_id: String, effort: String) -> Result<(), String> {
+    send(
+        &state,
+        &session_id,
+        json!({
+            "type": "set_thinking_level",
+            "level": effort
+        }),
+    )
+}
+
+// Answers a pending `extension_ui_request` (select/confirm/input/editor) a
+// plugin tool raised via `ctx.ui.*` \u2014 see docs/rpc.md "Extension UI Protocol".
+// Wii renders the request generically; it never needs to know which plugin
+// or tool asked.
+#[tauri::command]
+fn answer_extension_ui(
+    state: State<PiState>,
+    session_id: String,
+    id: String,
+    response: Value,
+) -> Result<(), String> {
+    let mut payload = match response {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("type".into(), json!("extension_ui_response"));
+    payload.insert("id".into(), json!(id));
+    send(&state, &session_id, Value::Object(payload))
 }
 
 #[tauri::command]
@@ -601,6 +882,80 @@ fn send_message(state: State<PiState>, session_id: String, message: String) -> R
 #[tauri::command]
 fn abort(state: State<PiState>, session_id: String) -> Result<(), String> {
     send(&state, &session_id, json!({ "type": "abort" }))
+}
+
+fn session_file(dir: &Path, id: &str) -> Option<PathBuf> {
+    fs::read_dir(dir).ok()?.flatten().map(|entry| entry.path()).find(|path| {
+        path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.ends_with(&format!("-{id}.jsonl")))
+    })
+}
+
+fn empty_history(path: &Path) -> Result<bool, String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(text.lines().filter(|line| !line.trim().is_empty()).all(|line| {
+        serde_json::from_str::<Value>(line).ok().and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string)).as_deref() == Some("session")
+    }))
+}
+
+fn stop_window_sessions(registry: &mut SessionRegistry, label: &str) -> Result<(), String> {
+    let ids: Vec<String> = registry.running.iter().filter(|(_, s)| s.label == label).map(|(id, _)| id.clone()).collect();
+    for id in ids {
+        if let Some(session) = registry.running.remove(&id) {
+            session.child.kill().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn register_webview(state: State<PiState>, window: WebviewWindow, owner: String) -> Result<(), String> {
+    let mut registry = state.sessions.lock().map_err(|_| "Session lock poisoned".to_string())?;
+    let label = window.label();
+    if registry.owners.get(label) == Some(&owner) { return Ok(()); }
+    // Reload replaces only children of this WebView, never another window.
+    stop_window_sessions(&mut registry, label)?;
+    registry.owners.insert(label.to_string(), owner);
+    Ok(())
+}
+
+#[tauri::command]
+fn close_session(app: AppHandle, window: WebviewWindow, state: State<PiState>, owner: String, session_id: String) -> Result<(), String> {
+    let mut registry = state.sessions.lock().map_err(|_| "Session lock poisoned".to_string())?;
+    if registry.owners.get(window.label()) != Some(&owner) { return Err("WebView owner expired".into()); }
+    let session = registry.running.get(&session_id).ok_or("Session is not running")?;
+    if session.owner != owner || session.label != window.label() { return Err("Session belongs to another WebView".into()); }
+    let session = registry.running.remove(&session_id).unwrap();
+    let new_session = session.resume_path.is_none() && !session.used;
+    session.child.kill().map_err(|e| e.to_string())?;
+    drop(registry);
+    if new_session {
+        if let Some(path) = session_file(&app_dir(&app)?.join("sessions"), &session_id) {
+            // Cleanup failure must not report a still-running child after successful kill.
+            if matches!(empty_history(&path), Ok(true)) {
+                if let Err(error) = fs::remove_file(path) { eprintln!("Cannot remove empty session: {error}"); }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ponytail: shells out to `git`, no libgit2 dep for one rev-parse call.
+#[tauri::command]
+fn get_git_branch(project_path: String) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&project_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
+    }
 }
 
 // ponytail: full directory scan stays until session counts make an index worthwhile.
@@ -701,19 +1056,8 @@ fn get_session_history(path: String) -> Result<Vec<Value>, String> {
 
 #[tauri::command]
 fn get_session_path(app: AppHandle, session_id: String) -> Result<Option<String>, String> {
-    let dir = app_dir(&app)?.join("sessions");
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.contains(&session_id) {
-                    return Ok(Some(path.to_string_lossy().to_string()));
-                }
-            }
-        }
-    }
-    Ok(None)
+    Ok(session_file(&app_dir(&app)?.join("sessions"), &session_id)
+        .map(|path| path.to_string_lossy().to_string()))
 }
 
 #[cfg(test)]
@@ -728,6 +1072,23 @@ mod tests {
             "Project path does not exist"
         );
     }
+
+    #[test]
+    fn only_exact_empty_new_history_is_deletable() {
+        let dir = std::env::temp_dir().join(format!("wii-session-test-{}", gen_session_id()));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("2026-01-01-abc.jsonl");
+        let other = dir.join("2026-01-01-xabc.jsonl");
+        fs::write(&target, "{\"type\":\"session\"}\n").unwrap();
+        fs::write(&other, "{\"type\":\"message\"}\n").unwrap();
+        assert_eq!(session_file(&dir, "abc"), Some(target.clone()));
+        assert!(empty_history(&target).unwrap());
+        fs::write(&target, "{\"type\":\"session\"}\n{\"type\":\"message\"}\n").unwrap();
+        assert!(!empty_history(&target).unwrap());
+        fs::write(&target, "not json").unwrap();
+        assert!(!empty_history(&target).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -738,6 +1099,7 @@ pub fn run() {
         .manage(PiState::default())
         .setup(|app| {
             let _ = prepare_runtime(app.handle());
+            let _ = ensure_user_wii_dirs();
             if let Ok(Some(config)) = read_provider_config(app.handle()) {
                 if let Some(active) = config.providers.iter().find(|p| p.id == config.active_id) {
                     *app.state::<PiState>().settings.lock().unwrap() = Some(active.clone());
@@ -753,6 +1115,18 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<PiState>() {
+                    if let Ok(mut registry) = state.sessions.lock() {
+                        if let Err(error) = stop_window_sessions(&mut registry, window.label()) {
+                            eprintln!("Cannot stop WebView children: {error}");
+                        }
+                        registry.owners.remove(window.label());
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_provider,
             save_provider,
@@ -760,9 +1134,18 @@ pub fn run() {
             save_providers,
             get_system_prompt,
             save_system_prompt,
+            register_webview,
             create_session,
+            set_session_model,
+            set_session_thinking,
             send_message,
             abort,
+            close_session,
+            answer_extension_ui,
+            get_git_branch,
+            list_plugins,
+            delete_plugin,
+            plugin_http_request,
             list_sessions,
             get_session_history,
             get_session_path
@@ -775,8 +1158,8 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<PiState>() {
                     if let Ok(mut sessions) = state.sessions.lock() {
-                        for (_, child) in sessions.drain() {
-                            let _ = child.kill();
+                        for (_, session) in sessions.running.drain() {
+                            let _ = session.child.kill();
                         }
                     }
                 }

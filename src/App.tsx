@@ -3,7 +3,6 @@ import { useSessionStore } from "@/store/session-store";
 import { Header } from "@/components/layout/Header";
 import { Timeline } from "@/components/timeline/Timeline";
 import { Composer } from "@/components/layout/Composer";
-import { Onboarding } from "@/components/layout/Onboarding";
 import { CommandCenter } from "@/components/modals/command-center/CommandCenter";
 import { SessionManager } from "@/components/modals/session-manager/SessionManager";
 
@@ -19,9 +18,9 @@ export default function App() {
     null;
 
   const switchActive = useSessionStore((state) => state.switchActive);
+  const closeTab = useSessionStore((state) => state.closeTab);
   const openTab = useSessionStore((state) => state.openTab);
   const startNewProjectSession = useSessionStore((state) => state.startNewProjectSession);
-  const abortActiveSession = useSessionStore((state) => state.abortActiveSession);
 
   const commandCenterOpen = useSessionStore((state) => state.commandCenterOpen);
   const setCommandCenterOpen = useSessionStore((state) => state.setCommandCenterOpen);
@@ -40,11 +39,6 @@ export default function App() {
         }
         if (commandCenterOpen) {
           setCommandCenterOpen(false);
-          return;
-        }
-        const active = activeId ? sessions[activeId] : null;
-        if (active?.busy) {
-          abortActiveSession();
           return;
         }
         return;
@@ -93,12 +87,23 @@ export default function App() {
         setSessionManagerOpen(true);
         return;
       }
+
+      // 7. Ctrl/Cmd + W: Close current active tab (never close the window/app)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "w") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (activeId) {
+          closeTab(activeId);
+        }
+        return;
+      }
     };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
     activeId,
+    closeTab,
     sessions,
     tabOrder,
     commandCenterOpen,
@@ -122,17 +127,14 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg font-sans text-foreground">
-      {/* Top Header tab bar */}
-      <Header />
+      {/* Top Header tab bar: hidden with no open tabs, Session Manager takes over instead */}
+      {hasTabs && <Header />}
 
-      {/* Main timeline or initial onboarding */}
-      {hasTabs ? (
+      {hasTabs && (
         <>
           <Timeline />
           <Composer />
         </>
-      ) : (
-        <Onboarding />
       )}
 
       {/* Modals */}

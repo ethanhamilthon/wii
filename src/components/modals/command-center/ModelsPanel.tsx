@@ -15,9 +15,9 @@ export const ModelsPanel: React.FC = () => {
 
   const allModels = React.useMemo(() => {
     return [
-      ...new Set([activeProvider?.model, ...(activeProvider?.models || []), ...cachedModels].filter(Boolean)),
+      ...new Set([...(activeProvider?.models || []), ...cachedModels].filter(Boolean)),
     ] as string[];
-  }, [activeProvider?.model, activeProvider?.models, cachedModels]);
+  }, [activeProvider?.models, cachedModels]);
 
   if (!allModels.length) {
     return (

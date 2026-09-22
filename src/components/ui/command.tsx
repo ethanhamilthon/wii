@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Command as CommandPrimitive } from "cmdk";
-import { Search } from "lucide-react";
+import { MagnifyingGlassIcon as Search } from "@radix-ui/react-icons";
 
 import { cn } from "@/lib/utils";
 

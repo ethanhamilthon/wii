@@ -14,6 +14,9 @@ const badgeVariants = cva(
         write: "text-purple bg-purple/10",
         edit: "text-amber bg-amber/10",
         cyan: "text-cyan bg-cyan/10",
+        success: "text-green bg-green/10",
+        warning: "text-amber bg-amber/10",
+        destructive: "text-red bg-red/10",
       },
     },
     defaultVariants: {

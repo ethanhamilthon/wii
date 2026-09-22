@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::Mutex,
@@ -209,7 +210,7 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         .resource_dir()
         .map_err(|error| error.to_string())?
         .join("pi");
-    let source = if source.exists() { source } else { bundled };
+    let source = if cfg!(debug_assertions) && source.exists() { source } else { bundled };
 
     fs::create_dir_all(runtime.join("theme")).map_err(|error| error.to_string())?;
     for file in ["theme/dark.json", "theme/light.json"] {
@@ -227,11 +228,8 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     let src_pi = source.join("pi");
-    let needs_copy = match (fs::metadata(&src_pi), fs::metadata(&pi_bin)) {
-        (Ok(src_meta), Ok(dst_meta)) => src_meta.len() != dst_meta.len(),
-        (Ok(_), Err(_)) => true,
-        _ => false,
-    };
+    if !src_pi.exists() { return Err(format!("Bundled pi missing: {}", src_pi.display())); }
+    let needs_copy = !same_file_content(&src_pi, &pi_bin)?;
 
     if needs_copy && src_pi.exists() {
         // Atomic copy: write to temp file then rename. NEVER overwrite a running binary in place.
@@ -254,47 +252,59 @@ fn prepare_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(pi_bin)
 }
 
-fn write_pi_config(app: &AppHandle, settings: &ProviderSettings) -> Result<(), String> {
+fn pi_provider_id(id: &str) -> String { format!("wii-{id}") }
+
+fn models_config(settings: &MultiProviderConfig) -> Value {
+    let providers: serde_json::Map<String, Value> = settings.providers.iter().map(|provider| {
+        let mut seen = std::collections::HashSet::new();
+        let models: Vec<Value> = provider.models.iter().filter(|m| seen.insert(*m)).map(|m| json!({
+            "id": m,
+            "name": m,
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 128000,
+            "maxTokens": 16384,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        })).collect();
+        (pi_provider_id(&provider.id), json!({
+            "baseUrl": provider.base_url,
+            "api": "openai-completions",
+            "apiKey": provider.api_key,
+            "authHeader": true,
+            "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": true },
+            "models": models
+        }))
+    }).collect();
+    json!({ "providers": providers })
+}
+
+fn same_file_content(a: &Path, b: &Path) -> Result<bool, String> {
+    let Ok(mut right) = fs::File::open(b) else { return Ok(false); };
+    if fs::metadata(a).map_err(|e| e.to_string())?.len() != right.metadata().map_err(|e| e.to_string())?.len() {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(a).map_err(|e| e.to_string())?;
+    let mut aa = [0; 8192];
+    let mut bb = [0; 8192];
+    loop {
+        let n = left.read(&mut aa).map_err(|e| e.to_string())?;
+        if n == 0 { return Ok(true); }
+        right.read_exact(&mut bb[..n]).map_err(|e| e.to_string())?;
+        if aa[..n] != bb[..n] { return Ok(false); }
+    }
+}
+
+fn write_pi_config(app: &AppHandle, settings: &MultiProviderConfig) -> Result<(), String> {
     let config = app_dir(app)?.join("pi");
     fs::create_dir_all(&config).map_err(|error| error.to_string())?;
-
-    let mut model_entries: Vec<Value> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for m in &settings.models {
-        if seen.insert(m.clone()) {
-            model_entries.push(json!({
-                "id": m,
-                "name": m,
-                "reasoning": true,
-                "input": ["text", "image"],
-                "contextWindow": 128000,
-                "maxTokens": 16384,
-                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-            }));
-        }
-    }
-
-    let models = json!({
-        "providers": {
-            "wii-openai": {
-                "baseUrl": settings.base_url,
-                "api": "openai-completions",
-                "apiKey": "$WII_API_KEY",
-                "authHeader": true,
-                "compat": {
-                    "supportsDeveloperRole": false,
-                    "supportsReasoningEffort": true
-                },
-                "models": model_entries
-            }
-        }
-    });
-
     let target_path = config.join("models.json");
     let tmp_path = config.join("models.json.tmp");
-    let content = serde_json::to_vec_pretty(&models).map_err(|error| error.to_string())?;
+    let content = serde_json::to_vec_pretty(&models_config(settings)).map_err(|error| error.to_string())?;
     fs::write(&tmp_path, &content).map_err(|error| error.to_string())?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
     fs::rename(&tmp_path, &target_path).map_err(|error| error.to_string())?;
 
     fs::write(
@@ -328,15 +338,19 @@ fn system_prompt_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_dir(app)?.join("system-prompt.txt"))
 }
 
-fn user_wii_dir() -> PathBuf {
+fn wii_dir_name(identifier: &str) -> &'static str {
+    if identifier.ends_with(".dev") { ".wii-dev" } else { ".wii" }
+}
+
+fn user_wii_dir(app: &AppHandle) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".wii")
+    home.join(wii_dir_name(&app.config().identifier))
 }
 
-fn ensure_user_wii_dirs() -> Result<PathBuf, String> {
-    let wii = user_wii_dir();
+fn ensure_user_wii_dirs(app: &AppHandle) -> Result<PathBuf, String> {
+    let wii = user_wii_dir(app);
     // Only "plugins" (Wii-native) matters now; skills/prompts/extensions/themes
     // are pi's own resource kinds and Wii deliberately never feeds them to pi.
     for sub in ["plugins"] {
@@ -369,8 +383,8 @@ fn ensure_user_wii_dirs() -> Result<PathBuf, String> {
 // ponytail: single JS file per plugin folder, no manifest.json — the exported
 // object carries its own id/name/description, one file to read instead of two.
 #[tauri::command]
-fn list_plugins() -> Vec<PluginFile> {
-    let dir = user_wii_dir().join("plugins");
+fn list_plugins(app: AppHandle) -> Vec<PluginFile> {
+    let dir = user_wii_dir(&app).join("plugins");
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&dir) else {
         return out;
@@ -398,11 +412,11 @@ fn list_plugins() -> Vec<PluginFile> {
 }
 
 #[tauri::command]
-fn delete_plugin(id: String) -> Result<(), String> {
+fn delete_plugin(app: AppHandle, id: String) -> Result<(), String> {
     if id.is_empty() || id.contains('/') || id.contains("..") {
         return Err("Invalid plugin id".into());
     }
-    let dir = user_wii_dir().join("plugins");
+    let dir = user_wii_dir(&app).join("plugins");
     let as_dir = dir.join(&id);
     let as_file = dir.join(format!("{id}.js"));
     if as_dir.is_dir() {
@@ -432,6 +446,8 @@ fn emit_line(app: &AppHandle, session_id: &str, line: &[u8]) {
 }
 
 fn pi_args(
+    app: &AppHandle,
+    provider_id: &str,
     model: &str,
     reasoning_effort: Option<&str>,
     session_id: &str,
@@ -444,7 +460,7 @@ fn pi_args(
         "--mode".into(),
         "rpc".into(),
         "--provider".into(),
-        "wii-openai".into(),
+        pi_provider_id(provider_id),
         "--model".into(),
         model.to_string(),
         "--approve".into(),
@@ -467,7 +483,7 @@ fn pi_args(
         if plugin_id.is_empty() || plugin_id.contains('/') || plugin_id.contains("..") {
             continue;
         }
-        let tools_path = user_wii_dir().join("plugins").join(plugin_id).join("tools.js");
+        let tools_path = user_wii_dir(app).join("plugins").join(plugin_id).join("tools.js");
         if tools_path.exists() {
             args.push("--extension".into());
             args.push(tools_path.to_string_lossy().to_string());
@@ -535,15 +551,14 @@ fn spawn_session(
     resume_path: Option<String>,
     project_path: Option<String>,
     tool_plugins: Vec<String>,
+    provider_id: String,
     model: String,
     reasoning_effort: Option<String>,
 ) -> Result<String, String> {
-    let settings = state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock poisoned".to_string())?
-        .clone()
-        .ok_or("Save provider settings first")?;
+    let config = read_provider_config(app)?.ok_or("Save provider settings first")?;
+    let provider = config.providers.iter().find(|p| p.id == provider_id)
+        .ok_or("Provider not found")?;
+    if !provider.models.contains(&model) { return Err("Model not found in provider".into()); }
     let system_prompt = state
         .system_prompt
         .lock()
@@ -564,10 +579,12 @@ fn spawn_session(
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
     let binary = prepare_runtime(app)?;
-    let _ = ensure_user_wii_dirs()?; // makes sure ~/.wii/plugins exists to scan
+    let _ = ensure_user_wii_dirs(app)?; // prepares this app's plugin directory
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
     let session_id = gen_session_id();
     let args = pi_args(
+        app,
+        &provider_id,
         &model,
         reasoning_effort.as_deref(),
         &session_id,
@@ -588,7 +605,6 @@ fn spawn_session(
         .env("WII_CODING_AGENT_SESSION_DIR", &sessions)
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_TELEMETRY", "0")
-        .env("WII_API_KEY", settings.api_key.as_str())
         .current_dir(project)
         .args(args)
         .set_raw_out(true);
@@ -700,6 +716,10 @@ fn save_providers(
     if config.providers.is_empty() {
         return Err("At least one provider is required".into());
     }
+    let mut ids = std::collections::HashSet::new();
+    if config.providers.iter().any(|p| p.id.is_empty() || p.id.contains('/') || !ids.insert(&p.id)) {
+        return Err("Provider IDs must be unique, nonempty and contain no slashes".into());
+    }
     let active = config
         .providers
         .iter()
@@ -717,7 +737,7 @@ fn save_providers(
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
 
-    write_pi_config(&app, &active)?;
+    write_pi_config(&app, &config)?;
     *state.settings.lock().map_err(|_| "Settings lock poisoned")? = Some(active);
     Ok(())
 }
@@ -806,6 +826,7 @@ fn create_session(
     resume_path: Option<String>,
     project_path: Option<String>,
     tool_plugins: Option<Vec<String>>,
+    provider_id: String,
     model: String,
     reasoning_effort: Option<String>,
 ) -> Result<String, String> {
@@ -817,19 +838,24 @@ fn create_session(
         resume_path,
         project_path,
         tool_plugins.unwrap_or_default(),
+        provider_id,
         model,
         reasoning_effort,
     )
 }
 
 #[tauri::command]
-fn set_session_model(state: State<PiState>, session_id: String, model: String) -> Result<(), String> {
+fn set_session_model(app: AppHandle, state: State<PiState>, session_id: String, provider_id: String, model: String) -> Result<(), String> {
+    let config = read_provider_config(&app)?.ok_or("Provider not found")?;
+    if !config.providers.iter().any(|p| p.id == provider_id && p.models.contains(&model)) {
+        return Err("Model not found in provider".into());
+    }
     send(
         &state,
         &session_id,
         json!({
             "type": "set_model",
-            "provider": "wii-openai",
+            "provider": pi_provider_id(&provider_id),
             "modelId": model
         }),
     )
@@ -1074,6 +1100,43 @@ mod tests {
     }
 
     #[test]
+    fn detects_runtime_change_without_size_change() {
+        let dir = std::env::temp_dir().join(format!("wii-runtime-test-{}", gen_session_id()));
+        fs::create_dir(&dir).unwrap();
+        let a = dir.join("a"); let b = dir.join("b");
+        fs::write(&a, b"same").unwrap(); fs::write(&b, b"size").unwrap();
+        assert!(!same_file_content(&a, &b).unwrap());
+        fs::write(&b, b"same").unwrap();
+        assert!(same_file_content(&a, &b).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn models_keep_provider_keys_and_duplicate_model_ids_separate() {
+        let config = MultiProviderConfig {
+            active_id: "one".into(),
+            providers: [
+                ("one", "https://one.test/v1", "key-one"),
+                ("two", "https://two.test/v1", "key-two"),
+            ].into_iter().map(|(id, url, key)| ProviderSettings {
+                id: id.into(), name: id.into(), base_url: url.into(), api_key: key.into(),
+                models: vec!["same-model".into(), "same-model".into()],
+            }).collect(),
+        };
+        let models = models_config(&config);
+        assert_eq!(models["providers"]["wii-one"]["models"].as_array().unwrap().len(), 1);
+        assert_eq!(models["providers"]["wii-two"]["models"][0]["id"], "same-model");
+        assert_eq!(models["providers"]["wii-one"]["baseUrl"], "https://one.test/v1");
+        assert_eq!(models["providers"]["wii-two"]["apiKey"], "key-two");
+    }
+
+    #[test]
+    fn dev_plugins_never_use_stable_source() {
+        assert_eq!(wii_dir_name("com.erdana.wii-harness.dev"), ".wii-dev");
+        assert_eq!(wii_dir_name("com.erdana.wii-harness"), ".wii");
+    }
+
+    #[test]
     fn only_exact_empty_new_history_is_deletable() {
         let dir = std::env::temp_dir().join(format!("wii-session-test-{}", gen_session_id()));
         fs::create_dir(&dir).unwrap();
@@ -1099,8 +1162,9 @@ pub fn run() {
         .manage(PiState::default())
         .setup(|app| {
             let _ = prepare_runtime(app.handle());
-            let _ = ensure_user_wii_dirs();
+            let _ = ensure_user_wii_dirs(app.handle());
             if let Ok(Some(config)) = read_provider_config(app.handle()) {
+                write_pi_config(app.handle(), &config)?;
                 if let Some(active) = config.providers.iter().find(|p| p.id == config.active_id) {
                     *app.state::<PiState>().settings.lock().unwrap() = Some(active.clone());
                 }

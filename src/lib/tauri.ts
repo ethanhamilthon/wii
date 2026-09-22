@@ -62,6 +62,7 @@ export async function createSession(options?: {
   resumePath?: string | null;
   projectPath?: string | null;
   toolPlugins?: string[];
+  providerId: string;
   model: string;
   reasoningEffort?: string | null;
 }): Promise<string> {
@@ -71,14 +72,15 @@ export async function createSession(options?: {
     resumePath: options?.resumePath ?? null,
     projectPath: options?.projectPath ?? null,
     toolPlugins: options?.toolPlugins ?? [],
+    providerId: options?.providerId,
     model: options?.model,
     reasoningEffort: options?.reasoningEffort ?? null,
   });
 }
 
-export async function setSessionModel(sessionId: string, model: string): Promise<void> {
+export async function setSessionModel(sessionId: string, providerId: string, model: string): Promise<void> {
   if (!isTauri) return;
-  return tauriInvoke<void>("set_session_model", { sessionId, model });
+  return tauriInvoke<void>("set_session_model", { sessionId, providerId, model });
 }
 
 export async function setSessionThinking(sessionId: string, effort: string): Promise<void> {

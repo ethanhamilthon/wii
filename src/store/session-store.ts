@@ -190,6 +190,7 @@ interface SessionStoreState {
     projectPath?: string | null,
     savedModel?: string | null,
     savedEffort?: string | null,
+    savedProviderId?: string | null,
   ) => Promise<string>;
   sendMessage: (message: string) => Promise<void>;
   abortActiveSession: () => Promise<void>;
@@ -271,12 +272,11 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
   },
 
   getAllKnownModels: () => {
-    const active = get().getActiveProvider();
-    const activeSession = get().getActiveSession();
-    const { cachedModels } = get();
-    return [
-      ...new Set([activeSession?.model, ...(active?.models || []), ...cachedModels].filter(Boolean)),
-    ] as string[];
+    const session = get().getActiveSession();
+    const provider = session
+      ? get().multiConfig.providers.find((p) => p.id === session.providerId)
+      : get().getActiveProvider();
+    return [...new Set([session?.model, ...(provider?.models || [])].filter(Boolean))] as string[];
   },
 
   getVisibleModels: () => {
@@ -322,7 +322,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
     }
   },
 
-  openTab: async (resumePath, presetTitle, projectPath, savedModel, savedEffort) => {
+  openTab: async (resumePath, presetTitle, projectPath, savedModel, savedEffort, savedProviderId) => {
     if (resumePath) {
       const { tabOrder, sessions } = get();
       const existing = tabOrder.map((id) => sessions[id]).find(
@@ -334,9 +334,11 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
       }
     }
 
-    const provider = get().getActiveProvider();
+    const provider = savedProviderId
+      ? get().multiConfig.providers.find((p) => p.id === savedProviderId)
+      : get().getActiveProvider();
     if (!provider || !provider.models || provider.models.length === 0) {
-      throw new Error("Active provider has no configured models");
+      throw new Error("Session provider has no configured models");
     }
 
     const { lastUsedModel, lastUsedEffort } = get();
@@ -365,6 +367,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
       resumePath: resumePath ?? null,
       projectPath: projectPath ?? null,
       toolPlugins,
+      providerId: provider.id,
       model,
       reasoningEffort,
     });
@@ -377,6 +380,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
       status: resumePath ? "idle" : "running",
       alive: true,
       busy: false,
+      providerId: provider.id,
       model,
       reasoningEffort,
       messages: [],
@@ -526,7 +530,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
     get().saveOpenTabs();
 
     if (isFirstMessage) {
-      const provider = get().getActiveProvider();
+      const provider = get().multiConfig.providers.find((p) => p.id === active.providerId);
       if (provider) {
         generateTitle(trimmed, provider, get().titlePrompt, active.model).then((title) => {
           if (!title) return;
@@ -580,7 +584,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
     const active = get().getActiveSession();
     if (!active) return;
     try {
-      await tauri.setSessionModel(active.id, model);
+      await tauri.setSessionModel(active.id, active.providerId, model);
       set((state) => {
         const s = state.sessions[active.id];
         if (!s) return state;
@@ -807,6 +811,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
           title: s.title,
           projectPath: s.projectPath,
           resumePath: s.resumePath,
+          providerId: s.providerId,
           model: s.model,
           reasoningEffort: s.reasoningEffort,
         };
@@ -866,7 +871,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
         if (Array.isArray(data.tabs) && data.tabs.length > 0) {
           for (const t of data.tabs) {
             if (t.resumePath || t.projectPath) {
-              await get().openTab(t.resumePath, t.title, t.projectPath, t.model, t.reasoningEffort);
+              await get().openTab(t.resumePath, t.title, t.projectPath, t.model, t.reasoningEffort, t.providerId);
             }
           }
           const { tabOrder } = get();

@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri",
+    "dev:app": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "build:dev": "tauri build --config src-tauri/tauri.dev.conf.json --bundles app",
     "build:pi": "./scripts/build-pi.sh"
   },
   "devDependencies": {

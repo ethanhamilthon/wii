@@ -1,0 +1,20 @@
+{
+  "productName": "Wii Dev",
+  "identifier": "com.erdana.wii-harness.dev",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --port 5174 --strictPort",
+    "devUrl": "http://localhost:5174"
+  },
+  "app": {
+    "windows": [{ "title": "Wii Dev", "width": 980, "height": 760, "minWidth": 680, "minHeight": 520 }]
+  },
+  "bundle": {
+    "icon": [
+      "icons-dev/32x32.png",
+      "icons-dev/128x128.png",
+      "icons-dev/128x128@2x.png",
+      "icons-dev/icon.icns",
+      "icons-dev/icon.ico"
+    ]
+  }
+}

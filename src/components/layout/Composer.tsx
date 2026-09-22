@@ -23,21 +23,14 @@ export const Composer: React.FC = () => {
   const activeSession = useSessionStore((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const multiConfig = useSessionStore((state) => state.multiConfig);
   const enabledModels = useSessionStore((state) => state.enabledModels);
-  const cachedModels = useSessionStore((state) => state.cachedModels);
   const setActiveSessionModel = useSessionStore((state) => state.setActiveSessionModel);
   const setActiveSessionReasoningEffort = useSessionStore((state) => state.setActiveSessionReasoningEffort);
 
-  const activeProvider =
-    multiConfig.providers.find((p) => p.id === multiConfig.activeId) ||
-    multiConfig.providers[0] ||
-    null;
-
+  const sessionProvider = multiConfig.providers.find((p) => p.id === activeSession?.providerId);
   const visibleModels = React.useMemo(() => {
-    const all = [
-      ...new Set([activeSession?.model, ...(activeProvider?.models || []), ...cachedModels].filter(Boolean)),
-    ] as string[];
+    const all = [...new Set([activeSession?.model, ...(sessionProvider?.models || [])].filter(Boolean))] as string[];
     return all.filter((m) => !enabledModels || enabledModels.has(m) || m === activeSession?.model);
-  }, [activeSession?.model, activeProvider?.models, cachedModels, enabledModels]);
+  }, [activeSession?.model, sessionProvider?.models, enabledModels]);
 
   const draft = useSessionStore((state) => (activeId ? state.drafts[activeId] ?? "" : ""));
   const setDraft = useSessionStore((state) => state.setDraft);

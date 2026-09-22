@@ -46,6 +46,7 @@ export interface SessionState {
   status: "running" | "idle" | "error";
   alive: boolean;
   busy: boolean;
+  providerId: string;
   model: string;
   reasoningEffort: string;
   messages: MessageItem[];
@@ -82,6 +83,7 @@ export interface PersistedTab {
   title: string;
   projectPath: string | null;
   resumePath: string | null;
+  providerId?: string;
   model?: string;
   reasoningEffort?: string;
 }

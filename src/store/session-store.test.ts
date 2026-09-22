@@ -46,9 +46,11 @@ describe("Phase 2: Per-session model and reasoning effort", () => {
     const session = useSessionStore.getState().sessions[id];
 
     expect(session.model).toBe("model-a");
+    expect(session.providerId).toBe("default");
     expect(session.reasoningEffort).toBe("medium");
     expect(tauri.createSession).toHaveBeenCalledWith(
       expect.objectContaining({
+        providerId: "default",
         model: "model-a",
         reasoningEffort: "medium",
       }),
@@ -91,7 +93,7 @@ describe("Phase 2: Per-session model and reasoning effort", () => {
     });
 
     await expect(useSessionStore.getState().openTab()).rejects.toThrow(
-      "Active provider has no configured models",
+      "Session provider has no configured models",
     );
   });
 
@@ -108,7 +110,7 @@ describe("Phase 2: Per-session model and reasoning effort", () => {
     await useSessionStore.getState().setActiveSessionModel("model-a");
     await useSessionStore.getState().setActiveSessionReasoningEffort("xhigh");
 
-    expect(tauri.setSessionModel).toHaveBeenCalledWith(id2, "model-a");
+    expect(tauri.setSessionModel).toHaveBeenCalledWith(id2, "default", "model-a");
     expect(tauri.setSessionThinking).toHaveBeenCalledWith(id2, "xhigh");
 
     const s1 = useSessionStore.getState().sessions[id1];
@@ -168,6 +170,29 @@ describe("Phase 2: Per-session model and reasoning effort", () => {
     expect(tauri.registerWebview).toHaveBeenCalledOnce();
     expect(vi.mocked(tauri.registerWebview).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(tauri.createSession).mock.invocationCallOrder[0]);
+  });
+
+  it("keeps same model ID scoped to each provider across tabs and restore", async () => {
+    useSessionStore.setState((state) => ({
+      multiConfig: {
+        ...state.multiConfig,
+        providers: [state.multiConfig.providers[0], {
+          id: "other", name: "Other", baseUrl: "https://other.test/v1", apiKey: "other-key", models: ["model-a"],
+        }],
+      },
+    }));
+    const first = await useSessionStore.getState().openTab(null, null, "/project");
+    await useSessionStore.getState().switchProvider("other");
+    const second = await useSessionStore.getState().openTab(null, null, "/project");
+    expect(useSessionStore.getState().sessions[first].providerId).toBe("default");
+    expect(useSessionStore.getState().sessions[second].providerId).toBe("other");
+    await useSessionStore.getState().setActiveSessionModel("model-a");
+    expect(tauri.setSessionModel).toHaveBeenCalledWith(second, "other", "model-a");
+    const saved = JSON.parse(localStorage.getItem("wii_open_tabs")!);
+    expect(saved.tabs.map((tab: { providerId: string }) => tab.providerId)).toEqual(["default", "other"]);
+    useSessionStore.setState({ sessions: {}, tabOrder: [], activeId: null, hasLoadedOnBoot: false });
+    await useSessionStore.getState().bootstrapApp();
+    expect(Object.values(useSessionStore.getState().sessions).map((s) => s.providerId)).toEqual(["default", "other"]);
   });
 
   it("calculates context window correctly based on model name", () => {

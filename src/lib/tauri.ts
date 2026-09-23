@@ -160,7 +160,7 @@ export async function listSessions(): Promise<SessionSummary[]> {
       {
         id: "mock-1",
         path: "/path/to/mock-1.jsonl",
-        projectPath: "/Users/erdana/Documents/one",
+        projectPath: "/mock/project",
         title: "Mock Past Session",
         lastActivity: new Date().toISOString(),
         searchText: "mock text",
@@ -196,7 +196,7 @@ export async function getSessionPath(sessionId: string): Promise<string | null> 
 }
 
 export async function pickFolder(): Promise<string | null> {
-  if (!isTauri) return "/Users/erdana/pi/wii-harness";
+  if (!isTauri) return "/mock/project";
   const res = await tauriInvoke<string | null>("plugin:dialog|open", {
     options: {
       directory: true,

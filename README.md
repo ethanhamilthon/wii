@@ -51,7 +51,7 @@ npm run dev:app
 npm run build:dev  # creates Wii Dev.app; does not install or replace Wii.app
 ```
 
-`build:pi` overwrites bundled `src-tauri/resources/pi/pi` **in this checkout**. It targets host architecture; release builds currently support macOS arm64 only.
+`build:pi` compiles `src-tauri/resources/pi/pi` from the `@earendil-works/pi-coding-agent` dev dependency (MIT) via `bun build --compile`. That binary is a build artifact: it is **git-ignored and not committed**, so `npm run build:pi` is required after every clean clone before `dev:app` or any bundle command. It targets host architecture; release builds currently support macOS arm64 only.
 
 ## macOS arm64 distribution (preview)
 
